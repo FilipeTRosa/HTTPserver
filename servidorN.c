@@ -1,5 +1,5 @@
-// servidor_final_completo.c
-// Servidor HTTP multithread com RTT, banda por cliente e limite de vazão
+// servidor_realtime.c
+// Servidor HTTP multithread com RTT, banda por cliente e log em tempo real
 // Bianca Durgante - Projeto Redes UNIPAMPA
 
 #include <stdio.h>
@@ -14,10 +14,9 @@
 
 #define PORTA_PADRAO 5000
 #define MAX_CLIENTES 100
-#define MAX_REQUISICOES 1000
 #define BUF_SIZE 4096
-#define MAX_PATH 256
-#define TX_PADRAO 1000 // kB/s para IPs não listados
+#define TX_PADRAO 1000 // kB/s padrão para IPs não listados
+#define MAX_QOS 100
 
 typedef struct {
     char ip[INET_ADDRSTRLEN];
@@ -30,29 +29,17 @@ typedef struct {
     double last_bandwidth;
     struct timeval last_request_time;
     int requisicoes;
-    int ativo;
     pthread_t thread_id;
 } ClienteInfo;
 
-typedef struct {
-    int id_requisicao;
-    char ip[INET_ADDRSTRLEN];
-    double rtt;
-    double bandwidth;
-    pthread_t thread_id;
-    int rejeitada; // 1 se rejeitada
-} RequisicaoInfo;
-
 ClienteInfo clientes[MAX_CLIENTES];
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-QoS_IP qos_ips[100];
+pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
+QoS_IP qos_ips[MAX_QOS];
 int qos_count = 0;
 
-RequisicaoInfo requisicoes[MAX_REQUISICOES];
-int requisicao_count = 0;
-
-double vazao_maxima = 1000; // kB/s
-double vazao_atual = 0;
+double vazao_max = 10000; // kB/s
+double vazao_atual = 0.0;
 
 // Funções
 void *atender_cliente(void *arg);
@@ -64,6 +51,8 @@ double calcular_tempo(struct timeval inicio, struct timeval fim);
 double buscar_taxa_ip(const char *ip);
 void carregar_qos(const char *arquivo_qos);
 long tamanho_arquivo_kb(const char *nome_arquivo);
+void log_requisicao(const char *ip, double rtt, double banda, int req, pthread_t tid);
+int pode_aceitar(double banda_solicitada);
 
 int main(int argc, char *argv[]) {
     int server_fd;
@@ -72,12 +61,15 @@ int main(int argc, char *argv[]) {
 
     int porta = (argc > 1) ? atoi(argv[1]) : PORTA_PADRAO;
     const char *arquivo_qos = (argc > 2) ? argv[2] : "ips.txt";
-    vazao_maxima = (argc > 3) ? atof(argv[3]) : 1000;
+    vazao_max = (argc > 3) ? atof(argv[3]) : 10000;
 
-    for (int i = 0; i < MAX_CLIENTES; i++) clientes[i].ativo = 0;
+    // Inicializa clientes
+    for (int i = 0; i < MAX_CLIENTES; i++)
+        clientes[i].requisicoes = 0;
 
     carregar_qos(arquivo_qos);
 
+    // Criação do socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("Erro ao criar socket");
         exit(EXIT_FAILURE);
@@ -101,7 +93,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Servidor iniciado na porta %d...\n", porta);
-    printf("Vazão máxima do servidor: %.2f kB/s\n", vazao_maxima);
+    printf("Vazão máxima do servidor: %.2f kB/s\n", vazao_max);
 
     pthread_create(&thread_monitor, NULL, monitorar_clientes, NULL);
 
@@ -114,6 +106,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        // Cria thread para atender o cliente
         pthread_t t;
         struct {
             int sock;
@@ -121,7 +114,6 @@ int main(int argc, char *argv[]) {
         } *arg_thread = malloc(sizeof(*arg_thread));
         arg_thread->sock = new_socket;
         arg_thread->addr = cliente_addr;
-
         pthread_create(&t, NULL, atender_cliente, arg_thread);
         pthread_detach(t);
     }
@@ -130,6 +122,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
+// Carrega arquivo QoS
 void carregar_qos(const char *arquivo_qos) {
     FILE *fp = fopen(arquivo_qos, "r");
     if (!fp) {
@@ -139,19 +132,29 @@ void carregar_qos(const char *arquivo_qos) {
     qos_count = 0;
     while (fscanf(fp, "%s %lf", qos_ips[qos_count].ip, &qos_ips[qos_count].taxa_kBps) == 2) {
         qos_count++;
+        if (qos_count >= MAX_QOS) break;
     }
     fclose(fp);
     printf("QoS carregado: %d IPs\n", qos_count);
 }
 
+// Busca taxa para IP
 double buscar_taxa_ip(const char *ip) {
-    for (int i = 0; i < qos_count; i++) {
+    for (int i = 0; i < qos_count; i++)
         if (strcmp(ip, qos_ips[i].ip) == 0)
             return qos_ips[i].taxa_kBps;
-    }
     return TX_PADRAO;
 }
 
+// Verifica se pode aceitar nova requisição sem ultrapassar vazão
+int pode_aceitar(double banda_solicitada) {
+    pthread_mutex_lock(&lock);
+    int resultado = (vazao_atual + banda_solicitada <= vazao_max);
+    pthread_mutex_unlock(&lock);
+    return resultado;
+}
+
+// Atendimento de cada cliente
 void *atender_cliente(void *arg) {
     struct {
         int sock;
@@ -165,7 +168,19 @@ void *atender_cliente(void *arg) {
     char ip_cliente[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &cliente_addr.sin_addr, ip_cliente, INET_ADDRSTRLEN);
 
+    double taxa_cliente = buscar_taxa_ip(ip_cliente);
+
+    if (!pode_aceitar(taxa_cliente)) {
+        pthread_mutex_lock(&print_lock);
+        printf("Rejeitado: %s - limite de banda atingido (%.2f / %.2f kB/s)\n",
+               ip_cliente, vazao_atual, vazao_max);
+        pthread_mutex_unlock(&print_lock);
+        close(sock);
+        return NULL;
+    }
+
     pthread_mutex_lock(&lock);
+    vazao_atual += taxa_cliente;
     int idx = buscar_cliente(ip_cliente);
     if (idx == -1) idx = registrar_cliente(ip_cliente);
     pthread_mutex_unlock(&lock);
@@ -174,6 +189,7 @@ void *atender_cliente(void *arg) {
     ssize_t n = read(sock, buffer, sizeof(buffer) - 1);
     if (n <= 0) {
         close(sock);
+        pthread_mutex_lock(&lock); vazao_atual -= taxa_cliente; pthread_mutex_unlock(&lock);
         return NULL;
     }
     buffer[n] = '\0';
@@ -191,65 +207,36 @@ void *atender_cliente(void *arg) {
         const char *msg = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         send(sock, msg, strlen(msg), 0);
         close(sock);
+        pthread_mutex_lock(&lock); vazao_atual -= taxa_cliente; pthread_mutex_unlock(&lock);
         return NULL;
     }
-
-    double taxa_cliente = buscar_taxa_ip(ip_cliente);
-
-    pthread_mutex_lock(&lock);
-    if (vazao_atual + taxa_cliente > vazao_maxima) {
-        const char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-        send(sock, msg, strlen(msg), 0);
-        if (requisicao_count < MAX_REQUISICOES) {
-            requisicoes[requisicao_count].id_requisicao = requisicao_count + 1;
-            strcpy(requisicoes[requisicao_count].ip, ip_cliente);
-            requisicoes[requisicao_count].rtt = 0;
-            requisicoes[requisicao_count].bandwidth = 0;
-            requisicoes[requisicao_count].thread_id = pthread_self();
-            requisicoes[requisicao_count].rejeitada = 1;
-            requisicao_count++;
-        }
-        printf("[RECUSA] Cliente %s recusado: limite de banda atingido.\n", ip_cliente);
-        pthread_mutex_unlock(&lock);
-        close(sock);
-        return NULL;
-    }
-    vazao_atual += taxa_cliente;
-    pthread_mutex_unlock(&lock);
 
     struct timeval inicio, fim;
     gettimeofday(&inicio, NULL);
-    enviar_arquivo(sock, arquivo, taxa_cliente);
-    gettimeofday(&fim, NULL);
 
+    enviar_arquivo(sock, arquivo, taxa_cliente);
+
+    gettimeofday(&fim, NULL);
     double duracao = calcular_tempo(inicio, fim);
     long tamanho_kB = tamanho_arquivo_kb(arquivo);
 
     pthread_mutex_lock(&lock);
     ClienteInfo *cli = &clientes[idx];
-    if (cli->requisicoes > 0)
-        cli->last_rtt = calcular_tempo(cli->last_request_time, inicio);
+    cli->last_rtt = (cli->requisicoes > 0) ? calcular_tempo(cli->last_request_time, inicio) : 0;
     cli->last_bandwidth = tamanho_kB / duracao;
     cli->last_request_time = inicio;
     cli->requisicoes++;
     cli->thread_id = pthread_self();
-
-    if (requisicao_count < MAX_REQUISICOES) {
-        requisicoes[requisicao_count].id_requisicao = requisicao_count + 1;
-        strcpy(requisicoes[requisicao_count].ip, ip_cliente);
-        requisicoes[requisicao_count].rtt = duracao;
-        requisicoes[requisicao_count].bandwidth = tamanho_kB / duracao;
-        requisicoes[requisicao_count].thread_id = pthread_self();
-        requisicoes[requisicao_count].rejeitada = 0;
-        requisicao_count++;
-    }
     vazao_atual -= taxa_cliente;
     pthread_mutex_unlock(&lock);
+
+    log_requisicao(ip_cliente, cli->last_rtt, cli->last_bandwidth, cli->requisicoes, cli->thread_id);
 
     close(sock);
     return NULL;
 }
 
+// Função para envio de arquivo com controle de banda
 void enviar_arquivo(int sock, const char *nome_arquivo, double taxa_kBps) {
     FILE *fp = fopen(nome_arquivo, "rb");
     if (!fp) {
@@ -278,18 +265,19 @@ void enviar_arquivo(int sock, const char *nome_arquivo, double taxa_kBps) {
     fclose(fp);
 }
 
+// Busca cliente existente
 int buscar_cliente(const char *ip) {
     for (int i = 0; i < MAX_CLIENTES; i++)
-        if (clientes[i].ativo && strcmp(clientes[i].ip, ip) == 0)
+        if (clientes[i].requisicoes > 0 && strcmp(clientes[i].ip, ip) == 0)
             return i;
     return -1;
 }
 
+// Registra novo cliente
 int registrar_cliente(const char *ip) {
     for (int i = 0; i < MAX_CLIENTES; i++) {
-        if (!clientes[i].ativo) {
+        if (clientes[i].requisicoes == 0) {
             strcpy(clientes[i].ip, ip);
-            clientes[i].ativo = 1;
             clientes[i].last_rtt = 0.0;
             clientes[i].last_bandwidth = 0.0;
             clientes[i].requisicoes = 0;
@@ -300,41 +288,50 @@ int registrar_cliente(const char *ip) {
     return -1;
 }
 
+// Calcula tempo em segundos
 double calcular_tempo(struct timeval inicio, struct timeval fim) {
     return (fim.tv_sec - inicio.tv_sec) + (fim.tv_usec - inicio.tv_usec) / 1e6;
 }
 
-void *monitorar_clientes(void *arg) {
-    (void)arg;
-
-    while (1) {
-        pthread_mutex_lock(&lock);
-        printf("\033[H\033[J"); // Limpa tela
-        printf("=== HISTÓRICO DE REQUISIÇÕES ===\n");
-        printf("%-4s | %-15s | %-8s | %-12s | %-10s\n", 
-               "ID", "IP", "RTT(s)", "Banda(kB/s)", "Thread");
-        printf("--------------------------------------------------------------------\n");
-
-        for (int i = 0; i < requisicao_count; i++) {
-            printf("%-4d | %-15s | %-8.3f | %-12.2f | %lu%s\n",
-                   requisicoes[i].id_requisicao,
-                   requisicoes[i].ip,
-                   requisicoes[i].rtt,
-                   requisicoes[i].bandwidth,
-                   (unsigned long)requisicoes[i].thread_id,
-                   requisicoes[i].rejeitada ? "  [REJEITADA]" : "");
-        }
-
-        printf("Vazão atual do servidor: %.2f / %.2f kB/s\n", vazao_atual, vazao_maxima);
-
-        pthread_mutex_unlock(&lock);
-        sleep(1);
-    }
-    return NULL;
+// Log em tempo real
+void log_requisicao(const char *ip, double rtt, double banda, int req, pthread_t tid) {
+    pthread_mutex_lock(&print_lock);
+    printf("%-15s | %-8.3f | %-12.2f | %-4d | %lu\n",
+           ip, rtt, banda, req, (unsigned long)tid);
+    pthread_mutex_unlock(&print_lock);
 }
 
+// Tamanho do arquivo em KB
 long tamanho_arquivo_kb(const char *nome_arquivo) {
     struct stat st;
     if (stat(nome_arquivo, &st) != 0) return -1;
     return st.st_size / 1024;
+}
+
+// Monitoramento final resumido (pode ser chamado manualmente se quiser)
+void *monitorar_clientes(void *arg) {
+    (void)arg;
+    while (1) {
+        sleep(5); // imprime a cada 5s
+        pthread_mutex_lock(&print_lock);
+        printf("\n=== HISTÓRICO DE REQUISIÇÕES ===\n");
+        printf("%-15s | %-8s | %-12s | %-4s | %-10s\n", 
+               "IP", "RTT(s)", "Banda(kB/s)", "Req", "Thread");
+        printf("--------------------------------------------------------------\n");
+        pthread_mutex_lock(&lock);
+        for (int i = 0; i < MAX_CLIENTES; i++) {
+            if (clientes[i].requisicoes > 0) {
+                printf("%-15s | %-8.3f | %-12.2f | %-4d | %lu\n",
+                       clientes[i].ip,
+                       clientes[i].last_rtt,
+                       clientes[i].last_bandwidth,
+                       clientes[i].requisicoes,
+                       (unsigned long)clientes[i].thread_id);
+            }
+        }
+        printf("Vazão atual do servidor: %.2f / %.2f kB/s\n", vazao_atual, vazao_max);
+        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&print_lock);
+    }
+    return NULL;
 }
