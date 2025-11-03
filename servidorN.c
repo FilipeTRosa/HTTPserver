@@ -1,3 +1,6 @@
+\\adicionar variavel nova para dividir a vazão pela quantidade de conexões
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
