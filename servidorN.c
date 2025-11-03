@@ -1,7 +1,3 @@
-// servidor_realtime.c
-// Servidor HTTP multithread com RTT, banda por cliente e log em tempo real
-// Bianca Durgante - Projeto Redes UNIPAMPA
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
